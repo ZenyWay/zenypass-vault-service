@@ -14,10 +14,12 @@
 ;
 import getAccountStreamOperators, { AccountStreamOperators } from './account-stream-operators'
 import { isFunction } from './utils'
-import { OpgpService, OpgpProxyKey } from 'opgp-service'
-import {
+import { OpgpService, Eventual } from 'opgp-service'
+import { Pbkdf2OpgpKey } from 'pbkdf2-opgp-key'
+import getPbkdf2Sha512, { Pbkdf2sha512DigestSpec } from 'pbkdf2sha512'
+import getCboxVault, {
   CboxVault, Streamable, OneOrMore, KeyRing,
-  VersionedDoc, DocId, DocRef, DocRevs, DocIdRange, DocRevStatus, ReadOpts
+  DocId, DocRef, DocIdRange, ReadOpts
 } from 'cbox-vault'
 import getAccountFactory, {
   AccountFactoryBuilder, AccountFactory, Account, AccountObject, AccountDoc
@@ -25,15 +27,24 @@ import getAccountFactory, {
 import { Observable } from 'rxjs'
 import { __assign as assign } from 'tslib'
 
-export { AccountFactory, Account, AccountObject }
+export {
+  AccountFactory, Account, AccountObject,
+  DocRef, DocId, DocIdRange, ReadOpts
+}
 
 export interface ZenypassVaultServiceFactory {
-  (vault: CboxVault, authorize: (passphrase?: string) => Promise<boolean>,
+  (db: any, opgp: OpgpService, key: Eventual<Pbkdf2OpgpKey>, encoder: Eventual<IdEncoderSpec>,
   opts?: Partial<ZenypassVaultServiceSpec>):  ZenypassVaultService
+}
+
+export interface IdEncoderSpec {
+  pbkdf2: Pbkdf2sha512DigestSpec,
+  bins: string[]
 }
 
 export interface ZenypassVaultServiceSpec {
   getAccountFactory: AccountFactoryBuilder
+  vault: CboxVault
 }
 
 export interface ZenypassVaultService {
@@ -111,7 +122,7 @@ export interface ZenypassVaultService {
   read (refs: Streamable<DocIdRange>, opts?: ReadOpts): Observable<Account[]>
   read (refs: Streamable<OneOrMore<DocRef>|DocIdRange>, opts?: ReadOpts):
   Observable<OneOrMore<Account>>
-  unlock(keys: KeyRing): ZenypassVaultService
+  unlock(key: Pbkdf2OpgpKey): ZenypassVaultService
 }
 
 const VAULT_SERVICE_SPEC_DEFAULTS = {
@@ -121,44 +132,94 @@ const VAULT_SERVICE_SPEC_DEFAULTS = {
 
 class _VaultService {
   static getInstance: ZenypassVaultServiceFactory =
-  function (vault: CboxVault, authorize: (passphrase?: string) => Promise<boolean>,
-  opts?: Partial<ZenypassVaultServiceSpec>): ZenypassVaultService {
+  function (db: any, opgp: OpgpService, key: Eventual<Pbkdf2OpgpKey>,
+  encoder: Eventual<IdEncoderSpec>, opts?: Partial<ZenypassVaultServiceSpec>) {
     const spec: ZenypassVaultServiceSpec = assign({}, VAULT_SERVICE_SPEC_DEFAULTS, opts)
+
+    const pbkdf2key = Promise.resolve(key)
+    const vault = Promise.all([ pbkdf2key, encoder ])
+    .then(([ key, encoder ]) => spec['cbox-vault'] || getVault(db, opgp, key, encoder))
+
+    const authkey = pbkdf2key.then(key => key.clone()) // locked
+    function authorize (passphrase: string): Promise<boolean> {
+      return authkey.then(key => key.unlock(passphrase)).then(Boolean)
+    }
     const getCustomAccountFactory = spec.getAccountFactory.bind(void 0, authorize)
     const operators = getAccountStreamOperators(getCustomAccountFactory)
 
-    const accountVault = new _VaultService(vault, operators.newAccount, operators)
-    return {
-      newAccount: accountVault.newAccount.bind(accountVault),
-      write: accountVault.write.bind(accountVault),
-      read: accountVault.read.bind(accountVault),
-      unlock (keys: KeyRing) {
-        return _VaultService.getInstance(vault.unlock(keys), authorize, opts)
-      }
-    }
+    return new _VaultService(vault, operators.newAccount, operators)
+    .toVaultService()
   }
 
   write (accounts: Streamable<OneOrMore<Account>>) {
     const doc$: Observable<OneOrMore<AccountDoc>> =
     this.operators.fromAccount(Observable.from(accounts))
 
+    const accountdoc$: Observable<OneOrMore<AccountDoc>> =
+    Observable.from(this.vault)
+    .concatMap(vault =>
+      vault.write<AccountDoc>(doc$))
+
     const account$: Observable<OneOrMore<Account>> =
-    this.operators.toAccount(this.vault.write(doc$))
+    this.operators.toAccount(accountdoc$)
 
     return account$
   }
 
   read (refs: Streamable<OneOrMore<DocRef>|DocIdRange>, opts?: ReadOpts) {
-    const doc$ = this.vault.read<AccountDoc>(refs)
-    const account$: Observable<OneOrMore<Account>> = this.operators.toAccount(doc$)
+    const doc$ = Observable.from(this.vault)
+    .concatMap(vault => vault.read<AccountDoc>(refs))
+
+    const account$: Observable<OneOrMore<Account>> =
+    this.operators.toAccount(doc$)
+
     return account$
   }
 
+  unlock (key: Eventual<Pbkdf2OpgpKey>): _VaultService {
+    const vault = Promise.all([ this.vault, key ])
+    .then(([ vault, key ]) => vault.unlock(getKeyRing(key)))
+    return new _VaultService(vault, this.newAccount, this.operators)
+  }
+
   private constructor (
-    readonly vault: CboxVault,
-    readonly newAccount: AccountFactory,
+    private readonly vault: Promise<CboxVault>,
+    private readonly newAccount: AccountFactory,
     private readonly operators: AccountStreamOperators
   ) {}
+
+  private toVaultService (): ZenypassVaultService {
+    const self = this
+    return {
+      newAccount: self.newAccount.bind(self),
+      write: self.write.bind(self),
+      read: self.read.bind(self),
+      unlock (key: Pbkdf2OpgpKey): ZenypassVaultService {
+        return self.unlock(key).toVaultService()
+      }
+    }
+  }
+}
+
+function getVault (db: any, opgp: OpgpService, key: Pbkdf2OpgpKey,
+encoder: IdEncoderSpec): CboxVault {
+  const pbkdf2 = getPbkdf2Sha512(encoder.pbkdf2)
+  function hash (id: string): Promise<Uint8Array|string> {
+    return pbkdf2(id).then(digest => digest.value)
+  }
+
+  return getCboxVault(db, opgp, getKeyRing(key), {
+    hash: hash,
+    bins: encoder.bins,
+    read: { include_docs: true }
+  })
+}
+
+function getKeyRing (key: Pbkdf2OpgpKey): KeyRing {
+  return {
+    auth: key.key,
+    cipher: key.key
+  }
 }
 
 const getVaultService: ZenypassVaultServiceFactory = _VaultService.getInstance

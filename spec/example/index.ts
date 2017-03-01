@@ -12,61 +12,74 @@
  * Limitations under the License.
  */
 ;
-import getVaultService from '../../src'
-import getCboxVault, { DocId, VersionedDoc } from 'cbox-vault'
-import getOpgpService, { OpgpKeyOpts } from 'opgp-service'
+import getVaultService, { Account, AccountObject, DocRef, IdEncoderSpec } from '../../src'
+import getOpgpService from 'opgp-service'
+import getPbkdf2OpgpKeyFactory from 'pbkdf2-opgp-key'
 import getRandomBinsFactory from 'randombins'
+const randombytes = require('randombytes')
 const PouchDB = require('pouchdb-browser')
-import getPbkdf2OSha512 from 'pbkdf2sha512'
-import { Observable } from 'rxjs'
+import { Observable, Scheduler } from 'rxjs'
 import debug = require('debug')
 debug.enable('zp-vault-example:*')
 
 const opgp = getOpgpService()
-const pbkdf2 = getPbkdf2OSha512({ iterations: 8192 }) // min iterations
 
-// set up key pair
-const passphrase = pbkdf2('secret passphrase')
-const keyspec: Promise<OpgpKeyOpts> = passphrase.then(digest => ({
-  passphrase: digest.value,
-  size: 2048,
-  unlocked: true
-}))
-const key = opgp.generateKey('john.doe@example.com', keyspec)
-
-// define random bins for more efficient startkey/endkey search
-// TODO: integrate this into ZenypassVaultService
+// setup id encoder specifications
 const alphabet = '-abcdefghijklmnopqrstuvw_'
-const getRandomBins = getRandomBinsFactory({ size: 16})
-const bins = getRandomBins([ alphabet, alphabet ])
-.reduce((arr, bin) => arr.concat(bin), [])
-
-const idHash = getPbkdf2OSha512({ iterations: 8192 })
-
-const db = new PouchDB('zenypass')
-const cbox = getCboxVault(db, opgp, { // encrypt and sign with same key-pair
-  cipher: key,
-  auth: key
-}, {
-  hash: (passphrase: string) => idHash(passphrase).then(({ value }) => value),
+const getRandomBins = getRandomBinsFactory({ size: 32 })
+const encoder: Promise<IdEncoderSpec> = getRandomBins([ alphabet, alphabet ])
+.reduce<string[]>((arr, bin) => arr.concat(bin), [])
+.then(bins => ({
   bins: bins,
-  read: { include_docs: true } // required for bulk read
+  pbkdf2: { // pbkdf2 parameters for id encoder
+    encoding: 'base64',
+    salt: <string>randombytes(64).toString('base64'),
+    iterations: 8192, // min 8192
+    length: 32, // min 32, max 64
+    hmac: <'sha512'>'sha512' // always 'sha512'
+  }
+}))
+
+// setup pbkdf2-protected PGP key pair
+const getPbkdf2OpgpKey = getPbkdf2OpgpKeyFactory(opgp, {
+  // keysize: 2048, locked: false (defaults)
+  pbkdf2: {
+    salt: 64, // generate random 64-byte long string, encoding: base64 (default)
+    iterations: 8192, // min 8192, default 65536
+    length: 64 // min 32, max 64, default 64
+    // digest is always 'sha512'
+  }
 })
+const key = getPbkdf2OpgpKey('j.doe@example.com', 'secret passphrase')
 
-function authorize (passphrase: string): Promise<boolean> {
-  return keyspec.then(({ passphrase }) => pbkdf2(passphrase)
-  .then(digest => digest.value === passphrase)) // optionally reject with Error when unauthorized
-}
+// setup Zenypass Vault
+const db = new PouchDB('accounts')
+const accounts = getVaultService(db, opgp, key, encoder)
 
-const vault = getVaultService(cbox, authorize)
-
-Observable.from([
+// source sequence of Account instances
+const account$ = Observable.from<Partial<AccountObject>>([
   { url: 'https://zenyway.com' },
   { url: 'https://en.wikipedia.org/w/index.php?title=Special:UserLogin' }
 ])
-.map(obj => vault.newAccount(obj))
-.do(debug('zp-vault-example:account:source:'))
-.let(vault.write)
-.forEach(debug('zp-vault-example:account:persisted:'))
-.then(debug('zp-vault-example:account:done:'))
-.catch(debug('zp-vault-example:account:error:'))
+.map(obj => accounts.newAccount(obj))
+.do<Account>(debug('zp-vault-example:account:'))
+.share().observeOn(Scheduler.asap) // hot Observable with isolation of subscriptions
+
+// persist source Account sequence to accounts vault
+// and extract _id properties of persisted instances
+const ref$ = account$
+.let(accounts.write)
+.do<Account>(debug('zp-vault-example:write:'))
+.map<Account,DocRef>(account => ({ _id: account._id }))
+.do<DocRef>(debug('zp-vault-example:ref:'))
+.share().observeOn(Scheduler.asap)
+
+// read Account sequence from accounts vault
+ref$
+.let(accounts.read)
+.forEach(debug('zp-vault-example:read:'))
+.then(debug('zp-vault-example:read:done:'))
+.catch(debug('zp-vault-example:read:error:'))
+.then(() => db.destroy())
+.then(debug('zp-vault-example:db-destroy:done'))
+.catch(debug('zp-vault-example:db-destroy:error:'))
