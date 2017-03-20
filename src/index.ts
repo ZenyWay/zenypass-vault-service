@@ -16,9 +16,9 @@ import getAccountStreamOperators, { AccountStreamOperators } from './account-str
 import { isFunction } from './utils'
 import { OpgpService, Eventual } from 'opgp-service'
 import { Pbkdf2OpgpKey } from 'pbkdf2-opgp-key'
-import getPbkdf2Sha512, { Pbkdf2sha512DigestSpec } from 'pbkdf2sha512'
+import getPbkdf2Sha512, { Pbkdf2sha512Digest, Pbkdf2sha512DigestSpec } from 'pbkdf2sha512'
 import getCboxVault, {
-  CboxVault, Streamable, OneOrMore, KeyRing,
+  CboxVaultSpec, CboxVault, Streamable, OneOrMore, KeyRing,
   DocId, DocRef, DocIdRange, ReadOpts
 } from 'cbox-vault'
 import getAccountFactory, {
@@ -33,7 +33,7 @@ export {
 }
 
 export interface ZenypassVaultServiceFactory {
-  (db: any, opgp: OpgpService, key: Eventual<Pbkdf2OpgpKey>, encoder: Eventual<IdEncoderSpec>,
+  (db: any, opgp: OpgpService, key: Eventual<Pbkdf2OpgpKey>,
   opts?: Partial<ZenypassVaultServiceSpec>):  ZenypassVaultService
 }
 
@@ -45,6 +45,7 @@ export interface IdEncoderSpec {
 export interface ZenypassVaultServiceSpec {
   getAccountFactory: AccountFactoryBuilder
   vault: CboxVault
+  encoder: Eventual<IdEncoderSpec>
 }
 
 export interface ZenypassVaultService {
@@ -133,12 +134,14 @@ const VAULT_SERVICE_SPEC_DEFAULTS = {
 class _VaultService {
   static getInstance: ZenypassVaultServiceFactory =
   function (db: any, opgp: OpgpService, key: Eventual<Pbkdf2OpgpKey>,
-  encoder: Eventual<IdEncoderSpec>, opts?: Partial<ZenypassVaultServiceSpec>) {
+  opts?: Partial<ZenypassVaultServiceSpec>) {
     const spec: ZenypassVaultServiceSpec = assign({}, VAULT_SERVICE_SPEC_DEFAULTS, opts)
 
     const pbkdf2key = Promise.resolve(key)
-    const vault = Promise.all([ pbkdf2key, encoder ])
-    .then(([ key, encoder ]) => spec['cbox-vault'] || getVault(db, opgp, key, encoder))
+    const vault = spec.vault
+    ? Promise.resolve(spec.vault)
+    : Promise.all([ pbkdf2key, spec.encoder ])
+    .then(([ key, encoder ]) => getVault(db, opgp, key, encoder))
 
     const authkey = pbkdf2key.then(key => key.clone()) // locked
     function authorize (passphrase: string): Promise<boolean> {
@@ -202,17 +205,26 @@ class _VaultService {
 }
 
 function getVault (db: any, opgp: OpgpService, key: Pbkdf2OpgpKey,
-encoder: IdEncoderSpec): CboxVault {
-  const pbkdf2 = getPbkdf2Sha512(encoder.pbkdf2)
-  function hash (id: string): Promise<Uint8Array|string> {
-    return pbkdf2(id).then(digest => digest.value)
+encoder?: IdEncoderSpec): CboxVault {
+  const opts: Partial<CboxVaultSpec> = { read: { include_docs: true } }
+
+  if (encoder) {
+    const pbkdf2 = getPbkdf2Sha512(encoder.pbkdf2)
+    opts.hash = getHash(pbkdf2)
+    opts.bins = encoder.bins
   }
 
-  return getCboxVault(db, opgp, getKeyRing(key), {
-    hash: hash,
-    bins: encoder.bins,
-    read: { include_docs: true }
-  })
+  return getCboxVault(db, opgp, getKeyRing(key), opts)
+}
+
+interface Digest {
+  (password: string | Buffer | Uint8Array): Promise<Pbkdf2sha512Digest>
+}
+
+function getHash (pbkdf2: Digest) {
+  return function hash (id: string): Promise<Uint8Array|string> {
+    return pbkdf2(id).then(digest => digest.value)
+  }
 }
 
 function getKeyRing (key: Pbkdf2OpgpKey): KeyRing {

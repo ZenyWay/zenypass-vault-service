@@ -23,7 +23,7 @@ debug.enable('zp-vault-example:*')
 
 const opgp = getOpgpService()
 
-// setup id encoder specifications
+// setup id encoder specifications (optional)
 const alphabet = '-abcdefghijklmnopqrstuvw_'
 const getRandomBins = getRandomBinsFactory({ size: 32 })
 const encoder: Promise<IdEncoderSpec> = getRandomBins([ alphabet, alphabet ])
@@ -53,7 +53,7 @@ const key = getPbkdf2OpgpKey('j.doe@example.com', 'secret passphrase')
 
 // setup Zenypass Vault
 const db = new PouchDB('accounts')
-const accounts = getVaultService(db, opgp, key, encoder)
+const accounts = getVaultService(db, opgp, key, { encoder: encoder })
 
 // source sequence of Account instances
 const account$ = Observable.from<Partial<AccountObject>>([
@@ -85,19 +85,19 @@ ref$
 ```
 the files of this example are available [in this repository](./spec/example).
 
-view a [live version of this example in your browser console](https://cdn.rawgit.com/ZenyWay/zenypass-vault-service/v0.1.0/spec/example/index.html),
+view a [live version of this example in your browser console](https://cdn.rawgit.com/ZenyWay/zenypass-vault-service/v0.2.0/spec/example/index.html),
 or clone this repository and run the following commands from a terminal:
 ```bash
 npm install
 npm run example
 ```
 
-# <a name="api"></a> API v0.1 experimental
+# <a name="api"></a> API v0.2 experimental
 `ES5` and [`Typescript`](http://www.typescriptlang.org/) compatible.
 coded in `Typescript 2`, transpiled to `ES5`.
 
 ~~for a detailed specification of the API,
-[run the unit tests in your browser](https://cdn.rawgit.com/ZenyWay/zenypass-vault-service/v0.1.0/spec/web/index.html).~~
+[run the unit tests in your browser](https://cdn.rawgit.com/ZenyWay/zenypass-vault-service/v0.2.0/spec/web/index.html).~~
 
 # <a name="contributing"></a> CONTRIBUTING
 see the [contribution guidelines](./CONTRIBUTING.md)

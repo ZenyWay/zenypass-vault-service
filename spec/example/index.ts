@@ -24,7 +24,7 @@ debug.enable('zp-vault-example:*')
 
 const opgp = getOpgpService()
 
-// setup id encoder specifications
+// setup id encoder specifications (optional)
 const alphabet = '-abcdefghijklmnopqrstuvw_'
 const getRandomBins = getRandomBinsFactory({ size: 32 })
 const encoder: Promise<IdEncoderSpec> = getRandomBins([ alphabet, alphabet ])
@@ -54,7 +54,7 @@ const key = getPbkdf2OpgpKey('j.doe@example.com', 'secret passphrase')
 
 // setup Zenypass Vault
 const db = new PouchDB('accounts')
-const accounts = getVaultService(db, opgp, key, encoder)
+const accounts = getVaultService(db, opgp, key, { encoder: encoder })
 
 // source sequence of Account instances
 const account$ = Observable.from<Partial<AccountObject>>([
